@@ -71,6 +71,18 @@ pub fn deep_skips_allowed(hash: Option<&str>) -> bool {
     decide(s.on, s.not.as_deref(), s.only.as_deref(), hash)
 }
 
+/// Whether the wave-wide form (group barriers inside branches, off by
+/// default: it hung the card on two particle programs) is asked for the
+/// program `hash` alone: `VICTORY_WAVE_WIDE_ONLY=<hash>,...` (local). For
+/// programs that otherwise end in 64-lane waves a 32-lane host refuses
+/// (`sr_tracing:CS_Tiling_Generate_Opaque`, `GpuParticleUpdate:CS_Visibility`).
+pub fn wide_allowed(hash: Option<&str>) -> bool {
+    static ONLY: OnceLock<Option<Vec<String>>> = OnceLock::new();
+    ONLY.get_or_init(|| std::env::var("VICTORY_WAVE_WIDE_ONLY").ok().map(|v| parse_hash_list(&v)))
+        .as_deref()
+        .is_some_and(|l| listed(l, hash))
+}
+
 /// Whether the wave64 forms, and so the deep-skips switches, can matter for
 /// the program of `container`: a console wave64 compute program, on a host
 /// of 32-lane waves. Cheap (no translation): a superset of the programs

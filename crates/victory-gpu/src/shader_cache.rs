@@ -106,7 +106,15 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
             // program a list names, or with `VICTORY_WAVE_DEEP_SKIPS=0`
             // any, gets there)
             let off = !emit::deep_skips_allowed(Some(&hash)) && emit::wave64_retried(container);
-            cached(cache, &program_key(build(), off), container, translate)
+            let mut key = program_key(build(), off);
+            // A program given the wave-wide form alone (`VICTORY_WAVE_WIDE_ONLY`): its own key too.
+            if emit::wide_allowed(Some(&hash)) {
+                let mut h = blake3::Hasher::new();
+                h.update(&key);
+                h.update(b"VICTORY_WAVE_WIDE on for this program");
+                key = *h.finalize().as_bytes();
+            }
+            cached(cache, &key, container, translate)
         }
         None => translate(container),
     }

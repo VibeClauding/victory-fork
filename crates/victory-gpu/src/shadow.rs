@@ -2736,6 +2736,46 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, false)
 }
 
+/// A copy of exactly the `len` bytes at `address`, for a typed buffer view
+/// that does not start on an element of its buffer's copy: a host view
+/// counts its first element from its buffer's start, a console view starts
+/// at any address (the world's culling constants, 12-byte elements at ring
+/// positions; refused, they read zeros and the culling dropped walls). The
+/// same range gets the same copy, so the slot's view and the pass that
+/// brings it up to date agree. (After upstream VIctory `86a5ed6`.)
+pub(crate) fn exact_view(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    use std::sync::LazyLock;
+    #[allow(clippy::type_complexity)]
+    static EXACT: LazyLock<Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)>> =
+        LazyLock::new(|| Mutex::new((0, BTreeMap::new())));
+    // Ring positions move every frame: the least recently asked for go.
+    const KEPT: usize = 1024;
+    if len == 0 {
+        return None;
+    }
+    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    let (tick, map) = &mut *guard;
+    *tick += 1;
+    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+        *used = *tick;
+        return Some(shadow.clone());
+    }
+    if map.len() >= KEPT
+        && let Some(&oldest) = map.iter().min_by_key(|(_, (_, used))| *used).map(|(k, _)| k)
+    {
+        map.remove(&oldest);
+    }
+    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    map.insert((address, len), (shadow.clone(), *tick));
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| tracing::info!("typed buffer views off their copy's elements get copies of their own"));
+    Some(shadow)
+}
+
 /// As [`find`], for an ask that is done with the copy when its list has
 /// run (a draw's vertex and index buffers, indirect arguments): outside
 /// buffer objects it takes a window that is there already and holds the

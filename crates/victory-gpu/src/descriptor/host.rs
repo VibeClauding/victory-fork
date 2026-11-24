@@ -1468,6 +1468,14 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     if len == 0 {
         return None;
     }
+    // A typed view off its buffer copy's elements reads a copy of its own
+    // (as `buffer_srv` makes it).
+    if let (Some((base, width)), Some(element)) = (buffer_extent(view), typed_srv_element(view))
+        && let Some(whole) = crate::shadow::find(base, width)
+        && whole.offset(base) % element != 0
+    {
+        return crate::shadow::exact_view(address, len).map(|shadow| (shadow, address, len));
+    }
     if view_extent()
         && let Some((base, width)) = buffer_extent(view)
         // (The console is lax: a view may begin past its buffer's end.)
@@ -1478,6 +1486,24 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
         return Some((shadow, address, len));
     }
     crate::shadow::find(address, len).map(|shadow| (shadow, address, len))
+}
+
+/// The element size of a typed buffer shader resource view (not raw, not
+/// structured), the views `buffer_srv` gives copies of their own.
+fn typed_srv_element(view: &View) -> Option<u64> {
+    const BUFFER: u32 = 1;
+    let words: &[u32; 10] = match view {
+        View::Shader(_, Some(d)) if d[1] == BUFFER => d,
+        View::Placed(false, resource, d) if resource[0] == BUFFER => d[..10].try_into().ok()?,
+        _ => return None,
+    };
+    let desc = srv_desc(words);
+    // SAFETY: a buffer view's union member.
+    let b = unsafe { desc.Anonymous.Buffer };
+    if b.StructureByteStride > 0 || b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 || desc.Format == DXGI_FORMAT_UNKNOWN {
+        return None;
+    }
+    crate::resource::element(desc.Format.0 as u32).map(|(bytes, _)| bytes).filter(|&e| e > 0)
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
@@ -1565,7 +1591,7 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
+    let mut shadow = crate::shadow::find(address, len)?;
     let offset = shadow.offset(address);
     // A structured view as a raw view of the same bytes (see `raw_window`).
     // SAFETY: a buffer view's union member.
@@ -1586,15 +1612,24 @@ fn buffer_srv(
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     if window.is_none() {
-        if element == 0 || offset % element != 0 {
-            once!(
-                offset,
-                element,
-                "buffer view not on an element of its host copy"
-            );
+        if element == 0 {
+            once!(offset, element, "buffer view of elements without a size");
             return None;
         }
-        buffer.FirstElement += offset / element;
+        if offset % element != 0 {
+            // Off its copy's elements: a copy of its own bytes
+            // ([`crate::shadow::exact_view`]; `buffer_copy` finds the same).
+            let start = address + buffer.FirstElement * element;
+            let bytes = u64::from(buffer.NumElements) * element;
+            let Some(own) = crate::shadow::exact_view(start, bytes) else {
+                once!(offset, element, "buffer view not on an element of its host copy");
+                return None;
+            };
+            shadow = own;
+            buffer.FirstElement = 0;
+        } else {
+            buffer.FirstElement += offset / element;
+        }
     }
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
