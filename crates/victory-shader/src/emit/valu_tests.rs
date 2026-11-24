@@ -1264,3 +1264,72 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn v_cvt_f32_f64_rounds_to_nearest_even() {
+    // v_cvt_f32_f64 v0, s[0:1] (VOP1 0x00F); the double's dwords in s0 (low) and s1.
+    let doubles: &[f64] = &[
+        0.0,
+        -0.0,
+        1.0,
+        -2.5,
+        0.1,
+        1.0 / 3.0,
+        6500.0,
+        3.4028234663852886e38,  // the largest float
+        3.4028235677973366e38,  // rounds up past it: infinity
+        1e300,
+        -1e300,
+        1.1754943508222875e-38, // the smallest normal float
+        1e-300,                 // flushes to zero
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::from_bits(0x3FF0_0000_1000_0000), // a tie, even below: stays
+        f64::from_bits(0x3FF0_0000_3000_0000), // a tie, odd below: rounds up
+        f64::from_bits(0x3FF0_0000_1000_0001), // just above half: up
+    ];
+    let shader = build_valu_cs(&[vop1(0x00F, 0, sgpr(0))]);
+    let inputs: Vec<[u32; 4]> = doubles
+        .iter()
+        .map(|d| [d.to_bits() as u32, (d.to_bits() >> 32) as u32, 0, 0])
+        .collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let want = (doubles[i] as f32).to_bits();
+        assert_eq!(got, want, "{backend}: v_cvt_f32_f64({:e}) = {got:#010x}, want {want:#010x}", doubles[i]);
+    });
+    // NaN stays NaN.
+    let nan = [0u32, 0x7FF8_0000, 0, 0];
+    run_cases(&shader, &[nan], |backend, _, _, got| {
+        assert!(f32::from_bits(got).is_nan(), "{backend}: NaN gave {got:#010x}");
+    });
+}
+
+#[test]
+fn v_permlane16_and_x16_pick_the_lanes_their_selects_name() {
+    // 32 threads, thread index in v0: v_permlane(x)16_b32 v5, v0, s0, s1;
+    // v_readlane_b32 s6, v5, s2; v_mov_b32 v0, s6.
+    let sels: [(u32, u32); 3] = [
+        (0x7654_3210, 0xFEDC_BA98), // identity within the row
+        (0x0123_4567, 0x89AB_CDEF), // reversed
+        (0x1111_1111, 0x5555_5555), // repeats
+    ];
+    for (op, x16) in [(0x377u16, false), (0x378, true)] {
+        let mut body = Vec::new();
+        body.extend_from_slice(&vop3(op, 5, vgpr(0), sgpr(0), sgpr(1)));
+        body.extend_from_slice(&vop3(0x360, 6, vgpr(5), sgpr(2), 0x80));
+        body.push(vop1(0x001, 0, sgpr(6)));
+        let shader = build_cs(&body, 32, 0);
+        let mut cases = Vec::new();
+        for &(lo, hi) in &sels {
+            for lane in [0u32, 5, 8, 15, 16, 21, 24, 31] {
+                cases.push([lo, hi, lane, 0]);
+            }
+        }
+        run_cases_on(&shader, &cases, &[("hardware", false)], |backend, _, [lo, hi, lane, _], got| {
+            let sel = u64::from(lo) | u64::from(hi) << 32;
+            let pick = (sel >> (4 * (lane & 15)) & 15) as u32;
+            let row = if x16 { (lane & 16) ^ 16 } else { lane & 16 };
+            assert_eq!(got, row | pick, "{backend}: op {op:#x} lane {lane} sel {sel:#018x}");
+        });
+    }
+}

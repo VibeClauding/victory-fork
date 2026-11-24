@@ -1262,6 +1262,7 @@ impl<'a> Lower<'a> {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
+                    || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -7187,6 +7188,110 @@ impl<'a> Lower<'a> {
                         .or_insert(Val::Missing("a lane mask read as data"));
                 }
                 Ok(())
+            }
+            "v_cvt_f32_f64" => {
+                // A double to a float, round to nearest even, in 32-bit
+                // integer code (no double operations on the host needed).
+                // shortcut: results below the smallest normal float flush
+                // to signed zero.
+                if v.clamp || v.omod != 0 || v.sdwa.is_some() || v.dpp.is_some() {
+                    return Err("v_cvt_f32_f64 with output modifiers");
+                }
+                let (lo, hi) = match v.src.first() {
+                    Some(&Operand::Vector { reg, .. }) => (Reg::V(reg), Reg::V(reg + 1)),
+                    Some(&Operand::Scalar { code, .. }) if code != NULL => (Reg::S(code), Reg::S(code + 1)),
+                    _ => return Err("v_cvt_f32_f64 of a constant"),
+                };
+                let lo = self.i32_of(inst.read(lo).ok_or("an unread operand")?)?;
+                let mut hi = self.i32_of(inst.read(hi).ok_or("an unread operand")?)?;
+                let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+                if v.abs & 1 != 0 {
+                    let m = k(self, 0x7fff_ffff);
+                    hi = self.s.m.bin(c, Bin::And, hi, m);
+                }
+                if v.neg & 1 != 0 {
+                    let m = k(self, 0x8000_0000);
+                    hi = self.s.m.bin(c, Bin::Xor, hi, m);
+                }
+                let (k20, k31, k3, k29, k23) = (k(self, 20), k(self, 31), k(self, 3), k(self, 29), k(self, 23));
+                let sign = self.s.m.bin(c, Bin::LShr, hi, k31);
+                let sign = self.s.m.bin(c, Bin::Shl, sign, k31);
+                let e = self.s.m.bin(c, Bin::LShr, hi, k20);
+                let k7ff = k(self, 0x7ff);
+                let e = self.s.m.bin(c, Bin::And, e, k7ff);
+                // mantissa: the top 23 of 52 bits, and the 29 below for rounding
+                let mhi = k(self, 0xfffff);
+                let m = self.s.m.bin(c, Bin::And, hi, mhi);
+                let m = self.s.m.bin(c, Bin::Shl, m, k3);
+                let top = self.s.m.bin(c, Bin::LShr, lo, k29);
+                let m = self.s.m.bin(c, Bin::Or, m, top);
+                let rmask = k(self, 0x1fff_ffff);
+                let rem = self.s.m.bin(c, Bin::And, lo, rmask);
+                let half = k(self, 0x1000_0000);
+                let k1 = k(self, 1);
+                let odd = self.s.m.bin(c, Bin::And, m, k1);
+                let above = self.s.m.cmp(c, pred::IUGT, rem, half);
+                let tie = self.s.m.cmp(c, pred::EQ, rem, half);
+                let zero = k(self, 0);
+                let odd_tie = self.s.m.cmp(c, pred::NE, odd, zero);
+                let tie = self.s.m.bin(c, Bin::And, tie, odd_tie);
+                let up = self.s.m.bin(c, Bin::Or, above, tie);
+                let up = self.s.m.select(c, up, k1, zero);
+                // rebias 1023 -> 127; the add carries a rounding overflow into the exponent
+                let bias = k(self, 1023 - 127);
+                let fe = self.s.m.bin(c, Bin::Sub, e, bias);
+                let bits = self.s.m.bin(c, Bin::Shl, fe, k23);
+                let bits = self.s.m.bin(c, Bin::Add, bits, m);
+                let bits = self.s.m.bin(c, Bin::Add, bits, up);
+                // out of range: e (11 bits) against the float's normal range
+                let (lo_e, hi_e) = (k(self, 1023 - 126), k(self, 1023 + 127));
+                let small = self.s.m.cmp(c, pred::IULT, e, lo_e);
+                let big = self.s.m.cmp(c, pred::IUGT, e, hi_e);
+                let inf = k(self, 0x7f80_0000);
+                let bits = self.s.m.select(c, big, inf, bits);
+                let bits = self.s.m.select(c, small, zero, bits);
+                // a rounding carry past the largest float is infinity too
+                let over = self.s.m.cmp(c, pred::IUGT, bits, inf);
+                let bits = self.s.m.select(c, over, inf, bits);
+                // NaN stays NaN (quiet), infinity stays infinity
+                let special = self.s.m.cmp(c, pred::EQ, e, k7ff);
+                let mant_lo = self.s.m.bin(c, Bin::Or, m, rem);
+                let is_nan = self.s.m.cmp(c, pred::NE, mant_lo, zero);
+                let qnan = k(self, 0x7fc0_0000);
+                let spec = self.s.m.select(c, is_nan, qnan, inf);
+                let bits = self.s.m.select(c, special, spec, bits);
+                let r = self.s.m.bin(c, Bin::Or, bits, sign);
+                int(self, r)
+            }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                // Each lane reads a lane of a row of 16: its own row
+                // (`v_permlane16`) or the other row of its 32-lane half
+                // (`x16`); lane i's pick within that row is nibble i of
+                // {src2, src1}. Confined to 32-lane halves, so a host wave of
+                // 32 holds every lane named, as for `ds_swizzle`.
+                // shortcut: FI and BC are not looked at: a source lane that is
+                // not running is read as the host gives it.
+                self.cross_lane(false)?;
+                let (x, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let lane = self.lane_index();
+                let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+                let (k15, k7, k2, k8) = (k(self, 15), k(self, 7), k(self, 2), k(self, 8));
+                let in_row = self.s.m.bin(c, Bin::And, lane, k15);
+                let high = self.s.m.cmp(c, pred::IUGE, in_row, k8);
+                let word = self.s.m.select(c, high, s2, s1);
+                let nib = self.s.m.bin(c, Bin::And, in_row, k7);
+                let sh = self.s.m.bin(c, Bin::Shl, nib, k2);
+                let pick = self.s.m.bin(c, Bin::LShr, word, sh);
+                let pick = self.s.m.bin(c, Bin::And, pick, k15);
+                let not15 = k(self, !15);
+                let mut row = self.s.m.bin(c, Bin::And, lane, not15);
+                if name == "v_permlanex16_b32" {
+                    let k16 = k(self, 16);
+                    row = self.s.m.bin(c, Bin::Xor, row, k16);
+                }
+                let src = self.s.m.bin(c, Bin::Or, row, pick);
+                let r = self.read_lane(x, src);
+                int(self, r)
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);

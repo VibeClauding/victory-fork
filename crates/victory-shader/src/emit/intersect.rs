@@ -94,6 +94,27 @@ impl<'a> Lower<'a> {
         let Operand::Vector { reg: dst, .. } = *data else {
             return Err("a ray-tracing node test's result");
         };
+        // `VICTORY_BVH_MISS=1` (local experiment): every node test misses,
+        // without reading the node. While the structure builder is off the
+        // structures are never built, and walking them gives hits on
+        // garbage; with clean misses the title's programs take their own
+        // miss paths (sky and probe light, nothing occluded).
+        if super::super::bvh_miss() {
+            let guard = self.guard(b, i)?;
+            let pointer = inst.read(Reg::V(regs[0])).ok_or("an unread operand")?;
+            let pointer = self.i32_of(pointer)?;
+            let c = self.cur;
+            let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+            let pair = self.s.m.bin(c, Bin::And, pointer, k6);
+            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+            let none = self.s.m.i32(bvh::NONE);
+            for (k, f) in bvh::MISS.iter().enumerate() {
+                let miss = self.s.m.i32(f.to_bits());
+                let r = self.s.m.select(c, is_box, none, miss);
+                self.write(inst, Reg::V(dst + k as u8), r, guard);
+            }
+            return Ok(());
+        }
         let site = (b, i);
         let nodes = self
             .x
