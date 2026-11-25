@@ -86,6 +86,8 @@ mod container;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
+#[cfg(all(test, windows))]
+mod memory_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
@@ -115,7 +117,7 @@ pub use lower::set_host_max_wave;
 pub use per_program::{deep_skips_allowed, for_program, wave64_retried, wide_allowed};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+    MEMORY_FAULTS, MEMORY_MARKS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     set_view_heap_limit, view_heap_limit,
 };
