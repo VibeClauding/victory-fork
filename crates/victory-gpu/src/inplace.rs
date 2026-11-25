@@ -138,8 +138,11 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
-    // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
+    // View memory: known from the runtime without asking Windows. One run
+    // of a committed section is placed in the section's own heap
+    // (`VICTORY_INPLACE_VIEWS`); other view memory is turned down.
+    let viewed = cover(start as usize, len as usize);
+    if viewed != Cover::None && !(views_in_place() && matches!(viewed, Cover::Run(..))) {
         STATS[4].fetch_add(1, Ordering::Relaxed);
         return None;
     }
@@ -148,7 +151,8 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         return None;
     }
     let host = crate::host::host()?;
-    match place_part(&host.device, start, len) {
+    let placed = if viewed == Cover::None { place_part(&host.device, start, len) } else { place_view(&host.device, start, len) };
+    match placed {
         Ok(placed) => {
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);
@@ -166,6 +170,55 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             None
         }
     }
+}
+
+/// `VICTORY_INPLACE_VIEWS=1`: a title buffer or window in view memory
+/// that is one run of one committed section of the page pool (made so by
+/// the runtime with `VICTORY_POOL_COMMIT=1`) is placed in a heap opened
+/// on the whole section, at the run's offset, instead of being copied.
+/// The card then reads and writes the physical pages themselves, which
+/// every view of them shows. Off by default.
+pub(crate) fn views_in_place() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_VIEWS").is_some_and(|v| v == "1"))
+}
+
+/// Heaps opened on whole committed sections of the page pool, by the
+/// section's handle; kept for the run (opening a section locks nothing).
+static SECTION_HEAPS: Mutex<BTreeMap<usize, ID3D12Heap>> = Mutex::new(BTreeMap::new());
+
+/// [`place_part`] for view memory: the 64 KiB pages that hold `[start,
+/// start + len)` must be one run of one committed section; the buffer is
+/// placed in that section's heap at the run's offset. `Err(None)` if they
+/// are not.
+pub(crate) fn place_view(device: &ID3D12Device, start: u64, len: u64) -> Result<Placed, Option<windows::core::Error>> {
+    let at = start & !(K64 as u64 - 1);
+    let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
+    let Cover::Run(section, offset) = cover(at as usize, bytes as usize) else {
+        return Err(None);
+    };
+    if !offset.is_multiple_of(K64 as u64) {
+        return Err(None);
+    }
+    let committed = views().sections.iter().any(|&(h, size, committed)| h == section && committed && offset + bytes <= size);
+    if !committed {
+        return Err(None);
+    }
+    let heap = {
+        let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        match heaps.get(&section) {
+            Some(heap) => heap.clone(),
+            None => {
+                let heap = open(device, From::Section(section)).map_err(Some)?;
+                heaps.insert(section, heap.clone());
+                heap
+            }
+        }
+    };
+    let buffer = place(device, &heap, offset, bytes).map_err(Some)?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
+    Ok(Placed { buffer, heap, gpu, bias: start - at })
 }
 
 /// What [`place_for`] gave is gone.
@@ -1239,6 +1292,55 @@ mod tests {
             assert_ne!(mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT), 0);
             assert!(matches!(place_part(&device, start, len), Err(None)));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// A title buffer in view memory, one run of a committed section: it is
+    /// placed in the section's heap at the run's offset, the GPU reads the
+    /// bytes written through the view, and its write shows at the view and
+    /// at another view of the same pages. A reserved section is turned
+    /// down without asking the host.
+    #[test]
+    fn warp_a_buffer_in_a_committed_section_is_placed_at_its_offset() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        let Some(device) = warp() else { return };
+        // SAFETY: a section and views of the test's own.
+        unsafe {
+            let make = |flags: u32| {
+                mem::CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), mem::PAGE_READWRITE | flags, 0, (8 * K64) as u32, std::ptr::null())
+            };
+            let section = make(mem::SEC_COMMIT);
+            assert!(!section.is_null());
+            let view = mem::MapViewOfFile(section, mem::FILE_MAP_ALL_ACCESS, 0, (2 * K64) as u32, 3 * K64).Value as usize;
+            let other = mem::MapViewOfFile(section, mem::FILE_MAP_ALL_ACCESS, 0, (3 * K64) as u32, K64).Value as usize;
+            assert!(view != 0 && other != 0);
+            title_memory_section(section as usize, 8 * K64 as u64, true);
+            title_memory_view(view, 3 * K64, section as usize, 2 * K64 as u64);
+            let (start, len) = (view as u64 + K64 as u64 + 0x40, K64 as u64);
+            let placed = place_view(&device, start, len).unwrap_or_else(|e| panic!("not placed: {e:?}"));
+            assert_eq!(placed.bias, 0x40);
+            assert_eq!(placed.buffer.GetDesc().Width, 2 * K64 as u64, "the pages that hold the buffer");
+            let mut rig = Rig::new(&device).unwrap();
+            fill(start as *mut u8, len as usize, 3);
+            let got = rig.fetch(&placed.buffer, placed.bias, len as usize).unwrap();
+            assert!(same(start as *const u8, &got), "the GPU reads the bytes written through the view");
+            rig.store(&placed.buffer, placed.bias, &[0x5a; 64]).unwrap();
+            assert!(same(start as *const u8, &[0x5a; 64]), "the GPU's write is at the view's address");
+            assert!(same((other + 0x40) as *const u8, &[0x5a; 64]), "and at another view of the same page");
+            drop(placed);
+            views_gone(view, 3 * K64);
+            // The same layout over a reserved section: turned down.
+            let reserved = make(mem::SEC_RESERVE);
+            title_memory_section(reserved as usize, 8 * K64 as u64, false);
+            title_memory_view(view, 3 * K64, reserved as usize, 2 * K64 as u64);
+            assert!(matches!(place_view(&device, start, len), Err(None)));
+            views_gone(view, 3 * K64);
+            SECTION_HEAPS.lock().unwrap().remove(&(section as usize));
+            for v in [view, other] {
+                mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut c_void });
+            }
+            CloseHandle(section);
+            CloseHandle(reserved);
         }
     }
 
