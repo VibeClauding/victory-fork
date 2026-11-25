@@ -674,10 +674,22 @@ void main() {
     /// compare before it, also a change back.
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
+        card_compare_stores_the_hash_it_made_when_told(crate::host::CARD_COMPARE, false);
+    }
+
+    /// The same of the compare with a group per piece
+    /// (`crate::host::CARD_COMPARE_WIDE`), and a change in a piece's last
+    /// 16 bytes, the share of its last thread.
+    #[test]
+    fn warp_card_compare_wide_stores_the_hash_it_made_when_told() {
+        card_compare_stores_the_hash_it_made_when_told(crate::host::CARD_COMPARE_WIDE, true);
+    }
+
+    fn card_compare_stores_the_hash_it_made_when_told(source: &str, wide: bool) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        let compare = compile_cs(&warp.device, source).expect("the card compare must compile on WARP");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;
@@ -703,7 +715,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                warp.list.Dispatch(if wide { PIECES } else { PIECES.div_ceil(64) }, 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -731,6 +743,13 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        // The last byte of the third piece and the first of the first.
+        for (at, flagged) in [(3 * PIECE - 1, [0, 0, 1]), (0, [1, 0, 0])] {
+            // SAFETY: inside the mapping.
+            unsafe { now_ptr.add(at).write_volatile(content[at] ^ 0x01) };
+            assert_eq!(run(&mut warp, 2), flagged);
+            assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        }
     }
 
     /// The fetch inside flights (`crate::host::CARD_FETCH`), on the software
