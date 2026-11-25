@@ -201,6 +201,9 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    /// Handles of the title's root views read by heap index
+    /// ([`Self::root_view_by_index`]): slot, UAV, handle.
+    root_views_by_index: Vec<(u8, bool, V)>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -1502,6 +1505,7 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            root_views_by_index: Vec::new(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -2677,6 +2681,23 @@ impl<'a> Lower<'a> {
             }
         };
         self.user_at(index)
+    }
+
+    /// The handle of the title's root SRV (or with `uav` root UAV) of root
+    /// parameter `slot`, from the view heap at the index the host passes in
+    /// the user data ([`super::root_views_by_index`]); one per slot, made in
+    /// the entry block.
+    fn root_view_by_index(&mut self, slot: u8, uav: bool) -> V {
+        if let Some(&(_, _, h)) = self.root_views_by_index.iter().find(|r| r.0 == slot && r.1 == uav) {
+            return h;
+        }
+        let index = self.host_word(RootType::Other(super::shader::USER_VIEW_SLOT), slot, u32::from(uav));
+        let entry = self.s.entry;
+        let props = if uav { (11 | 0x1000, 0) } else { (11, 0) };
+        let h = self.s.heap_handle(entry, index, false, false, props);
+        self.s.flags |= super::shader::flags::RAW_BUFFERS;
+        self.root_views_by_index.push((slot, uav, h));
+        h
     }
 
     /// User-data dword `index`, loaded in the entry block.
@@ -6313,6 +6334,9 @@ impl<'a> Lower<'a> {
                     (RootType::Descriptor, Some(ResourceType::Cbv) | None, 13) => {
                         Ok(self.s.root_cbv_handle(rp.slot))
                     }
+                    (RootType::Descriptor, Some(ResourceType::Srv), 11) if super::root_views_by_index() => {
+                        Ok(self.root_view_by_index(rp.slot, false))
+                    }
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
                         Ok(self.s.root_srv_handle(rp.slot))
                     }
@@ -6320,6 +6344,9 @@ impl<'a> Lower<'a> {
                     // (11) or writes (11 with the UAV bit). Indexed
                     // accesses reach here as raw ones at index times the
                     // entry's stride (`buffer`).
+                    (RootType::Descriptor, Some(ResourceType::Uav), 11 | 0x100b) if super::root_views_by_index() => {
+                        Ok(self.root_view_by_index(rp.slot, true))
+                    }
                     (RootType::Descriptor, Some(ResourceType::Uav), 11 | 0x100b) => {
                         Ok(self.s.root_uav_handle(rp.slot))
                     }

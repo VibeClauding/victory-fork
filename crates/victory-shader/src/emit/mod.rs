@@ -114,7 +114,7 @@ pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, USER_VIEW_SLOT,
     set_view_heap_limit, view_heap_limit,
 };
 
@@ -166,6 +166,16 @@ pub fn group_sync() -> u8 {
         Some("1") => 1,
         _ => 2,
     })
+}
+
+/// `VICTORY_ROOT_VIEW_INDEX=1`: the title's root SRVs and UAVs are read
+/// through the view heap at an index the host passes in the user data
+/// ([`USER_VIEW_SLOT`]), not through a one-view table parameter. Off by
+/// default. Needs the host's bounded root views (not
+/// `VICTORY_ROOT_SRV_DIRECT`).
+pub fn root_views_by_index() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_VIEW_INDEX").is_some_and(|v| v == "1"))
 }
 
 /// The clean-up passes that run over a translated program before it is
