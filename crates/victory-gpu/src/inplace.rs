@@ -138,6 +138,11 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
+    // What the card reads in place crosses the bus at every read: the
+    // ones it reads much stay copies in its own memory.
+    if (window && !windows_in_place()) || len > most_each() {
+        return None;
+    }
     // View memory: known from the runtime without asking Windows. One run
     // of a committed section is placed in the section's own heap
     // (`VICTORY_INPLACE_VIEWS`); other view memory is turned down.
@@ -181,6 +186,21 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
 pub(crate) fn views_in_place() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_VIEWS").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_INPLACE_WINDOWS=0`: windows outside buffers are copied as
+/// before even at [`level`] 1 and up (they are the big part of what is in
+/// place, and what the card reads in place it reads over the bus).
+fn windows_in_place() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_WINDOWS").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_INPLACE_MAX_KB`: what is larger is copied as before (no limit
+/// unless set).
+fn most_each() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| std::env::var("VICTORY_INPLACE_MAX_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(u64::MAX, |kb| kb << 10))
 }
 
 /// Heaps opened on whole committed sections of the page pool, by the
