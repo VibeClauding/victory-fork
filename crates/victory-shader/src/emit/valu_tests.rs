@@ -153,13 +153,17 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         code,
     };
 
+    lower_compute(&native)
+}
+
+fn lower_compute(native: &NativeProgram) -> HostShader {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res =
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
+    let io = io::raise(&p, native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
-        native: &native,
+        native,
         p: &p,
         st: &st,
         io: &io,
@@ -191,6 +195,127 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     }
 
     shader
+}
+
+/// Each dispatch must select a bounded heap view using the dword the
+/// translator assigned to that root descriptor. Both allocations are longer
+/// than the corresponding view so resource bounds cannot explain the result.
+#[test]
+fn indexed_root_buffer_reads_and_writes_obey_view_bounds() {
+    // Hold the suite's GPU lock in the parent as well as in the isolated
+    // child. The child sets the mode before the translator can cache it.
+    let _gpu = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    if std::env::var_os("VICTORY_ROOT_VIEW_INDEX").is_none_or(|v| v != "1") {
+        let name = std::thread::current().name().unwrap().to_string();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture"])
+            .env("VICTORY_ROOT_VIEW_INDEX", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        let stderr = String::from_utf8_lossy(&child.stderr);
+        assert!(
+            child.status.success() && stdout.contains("1 passed; 0 failed"),
+            "isolated test {name} did not pass: {stdout}{stderr}"
+        );
+        return;
+    }
+    let slots = [(2, 0, ResourceType::Srv), (5, 4, ResourceType::Uav)];
+    // Complete the two raw descriptors around their root address pairs
+    // s[0:1] and s[4:5]. v0 and v1 load dwords zero and one from the SRV.
+    let mut words = Vec::new();
+    for base in [0, 4] {
+        words.push(s_mov_b32(base + 2, 0xc1));
+        words.extend([s_mov_b32(base + 3, 0xff), 0x1101_4fac]);
+    }
+    words.extend([0xe030_0000, 0x8000_0000, 0xe030_0004, 0x8000_0100]);
+    // Seed destination word 1 before replacing it with the out-of-view read.
+    for (v, offset) in [(0, 0), (0, 4), (1, 4), (0, 8)] {
+        words.extend(buffer_store_dword(v, 4, offset));
+    }
+    words.push(S_ENDPGM);
+    let shader = lower_compute(&NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 2,
+        layout: slots
+            .iter()
+            .map(|&(slot, user_data, _)| RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data,
+                slot,
+            })
+            .collect(),
+        used: slots
+            .iter()
+            .map(|&(slot, user_data, kind)| UsedResource {
+                kind,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data,
+                slot,
+            })
+            .collect(),
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 6 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    });
+    assert!(shader.root_srvs.is_empty() && shader.root_uavs.is_empty());
+    let host = Host::new(false)
+        .or_else(|_| Host::new(true))
+        .expect("SM 6.6 host");
+    let (root, pso) = host.compute_pipeline(&shader).unwrap();
+    let views = [
+        View::Buffer {
+            data: &[17, 91],
+            stride: super::host::Stride::RawPrefix(1),
+        },
+        View::Buffer {
+            data: &[29, 93],
+            stride: super::host::Stride::RawPrefix(1),
+        },
+        View::RawUavPrefix {
+            allocation: 3,
+            visible: 2,
+        },
+        View::RawUavPrefix {
+            allocation: 3,
+            visible: 2,
+        },
+    ];
+    for (srv, uav, value) in [(1, 2, 29), (0, 3, 17)] {
+        let mut constants = vec![0; shader.user_data_dwords() as usize];
+        for u in &shader.user_data {
+            constants[u.index as usize] = match (u.root, u.slot, u.dword) {
+                (RootType::Other(super::USER_VIEW_SLOT), 2, 0) => srv,
+                (RootType::Other(super::USER_VIEW_SLOT), 5, 1) => uav,
+                (RootType::Other(super::USER_VIEW_BIAS), 5, 0) => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(constants))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap();
+        assert_eq!(out[(uav - 2) as usize], [value, 0, 0]);
+        assert_eq!(out[(3 - uav) as usize], [0; 3]);
+    }
 }
 
 /// One GPU test at a time. With these tests on the hardware adapter and WARP
