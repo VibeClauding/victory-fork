@@ -77,6 +77,14 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+/// `RootType::Other` code of a user-data dword the host computes: the view
+/// heap slot of the one-view table it makes for the root view of root
+/// parameter `slot` (dword 0 for a root SRV, 1 for a root UAV), read with
+/// `createHandleFromHeap` instead of through a table root parameter
+/// ([`super::root_views_by_index`]). The view keeps its bounds, and every
+/// root argument a draw sets is then a root constant, which a command
+/// signature can set per record.
+pub const USER_VIEW_SLOT: u32 = 0x104;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

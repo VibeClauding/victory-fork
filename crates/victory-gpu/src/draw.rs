@@ -1017,6 +1017,35 @@ impl State {
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
+                    if u.root == RootType::Other(victory_shader::emit::USER_VIEW_SLOT) {
+                        // The title's root view read by heap index: its
+                        // bounded one-view table, made as for a table
+                        // parameter, and its slot passed here.
+                        let address = match self.roots_ref(compute).get(usize::from(u.slot)) {
+                            Some(&Root::View(address)) => Some(address),
+                            _ => {
+                                once!(slot = u.slot, "a shader reads a root view the title did not set");
+                                None
+                            }
+                        };
+                        let index = if u.dword == 1 {
+                            self.root_uav(list, address, None, compute, writes)
+                        } else {
+                            let biased = t.host.user_data.iter().any(|b| {
+                                b.slot == u.slot
+                                    && b.root == RootType::Other(victory_shader::emit::USER_VIEW_BIAS)
+                            });
+                            self.root_srv_table(list, address, None, compute, biased)
+                        };
+                        match index {
+                            Some(index) if index != u32::MAX => values[u.index as usize] = index,
+                            _ => {
+                                once!("a root view read by heap index has no slot (no view heap, or root descriptors): the draw is dropped");
+                                return false;
+                            }
+                        }
+                        continue;
+                    }
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
                             self.host_word(compute, kind, u.slot, u.dword, memory.as_ref());
@@ -1078,7 +1107,7 @@ impl State {
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         // A table left unset is undefined: a null view.
-                        if tabled && !self.root_srv_table(list, None, param, compute, false) {
+                        if tabled && self.root_srv_table(list, None, Some(param), compute, false).is_none() {
                             return false;
                         }
                         continue;
@@ -1090,7 +1119,7 @@ impl State {
                                 && u.root == RootType::Other(victory_shader::emit::USER_VIEW_BIAS)
                         });
                     if tabled {
-                        if !self.root_srv_table(list, Some(address), param, compute, biased) {
+                        if self.root_srv_table(list, Some(address), Some(param), compute, biased).is_none() {
                             return false;
                         }
                         continue;
@@ -1141,7 +1170,7 @@ impl State {
                         None
                     }
                 };
-                if !self.root_uav(list, address, param, compute, writes) {
+                if self.root_uav(list, address, Some(param), compute, writes).is_none() {
                     return false;
                 }
             }
@@ -1167,10 +1196,10 @@ impl State {
         &mut self,
         list: &HostList,
         address: Option<u64>,
-        param: u32,
+        param: Option<u32>,
         compute: bool,
         writes: bool,
-    ) -> bool {
+    ) -> Option<u32> {
         const UNORDERED: i32 = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
         static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let limit = *LIMIT.get_or_init(|| {
@@ -1199,8 +1228,10 @@ impl State {
         if !crate::pipeline::host::bounded_root_srvs() {
             let Some((a, s)) = address.and_then(|a| Some((a, find(a)?))) else {
                 once!("a root UAV with nothing to bind: the draw is dropped");
-                return false;
+                return None;
             };
+            // A root descriptor has no heap index to pass.
+            let param = param?;
             ready(a, &s);
             // From the 16 bytes below: the shader adds the rest.
             // SAFETY: a live buffer.
@@ -1214,7 +1245,7 @@ impl State {
                     list.list.SetGraphicsRootUnorderedAccessView(param, gpu);
                 }
             }
-            return true;
+            return Some(u32::MAX);
         }
         let heap = match self.heaps[0] {
             0 => None,
@@ -1222,16 +1253,14 @@ impl State {
         };
         let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
             once!("a root UAV without a bound view heap: the draw is dropped");
-            return false;
+            return None;
         };
         let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
         let (index, shadow) = match self.root_uav_slots.get(&key) {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
-                    return false;
-                };
+                let index = host.dynamic(1)?;
                 self.dynamic.push((key.0, index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
@@ -1256,16 +1285,20 @@ impl State {
         if let Some((a, s)) = &shadow {
             ready(*a, s);
         }
-        let handle = host.gpu_handle(index);
-        // SAFETY: an open list; the slot is in the bound view heap.
-        unsafe {
-            if compute {
-                list.list.SetComputeRootDescriptorTable(param, handle);
-            } else {
-                list.list.SetGraphicsRootDescriptorTable(param, handle);
+        // Without a parameter the shader reads the slot by its heap index
+        // (`victory_shader::emit::USER_VIEW_SLOT`).
+        if let Some(param) = param {
+            let handle = host.gpu_handle(index);
+            // SAFETY: an open list; the slot is in the bound view heap.
+            unsafe {
+                if compute {
+                    list.list.SetComputeRootDescriptorTable(param, handle);
+                } else {
+                    list.list.SetGraphicsRootDescriptorTable(param, handle);
+                }
             }
         }
-        true
+        Some(index)
     }
 
     /// Binds a root SRV as a one-view table
@@ -1278,17 +1311,17 @@ impl State {
         &mut self,
         list: &HostList,
         address: Option<u64>,
-        param: u32,
+        param: Option<u32>,
         compute: bool,
         biased: bool,
-    ) -> bool {
+    ) -> Option<u32> {
         let heap = match self.heaps[0] {
             0 => None,
             h => Some(crate::descriptor::heap(h as This)),
         };
         let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
             once!("a root SRV without a bound view heap: the draw is dropped");
-            return false;
+            return None;
         };
         // A view that begins early is another view than one that does not
         // (title addresses stay below bit 63).
@@ -1300,9 +1333,7 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
-                    return false;
-                };
+                let index = host.dynamic(1)?;
                 self.dynamic.push((key.0, index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
@@ -1339,16 +1370,20 @@ impl State {
         if let Some((a, s)) = &shadow {
             s.refresh(list, *a, s.left(*a));
         }
-        let handle = host.gpu_handle(index);
-        // SAFETY: an open list; the slot is in the bound view heap.
-        unsafe {
-            if compute {
-                list.list.SetComputeRootDescriptorTable(param, handle);
-            } else {
-                list.list.SetGraphicsRootDescriptorTable(param, handle);
+        // Without a parameter the shader reads the slot by its heap index
+        // (`victory_shader::emit::USER_VIEW_SLOT`).
+        if let Some(param) = param {
+            let handle = host.gpu_handle(index);
+            // SAFETY: an open list; the slot is in the bound view heap.
+            unsafe {
+                if compute {
+                    list.list.SetComputeRootDescriptorTable(param, handle);
+                } else {
+                    list.list.SetGraphicsRootDescriptorTable(param, handle);
+                }
             }
         }
-        true
+        Some(index)
     }
 
     /// For a shader that picks buffers from the view heap by an index it
