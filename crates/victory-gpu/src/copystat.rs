@@ -133,6 +133,11 @@ pub(crate) enum C {
     /// `watch::writes` askings not made because the range's first block is
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
+    /// Kernel askings for a submission's grouped ranges (`watch::ask_run`)
+    /// that failed (the group spans more than one reservation, or memory
+    /// that is not write-watched), and their microseconds.
+    WatchAheadFailed,
+    WatchAheadFailUs,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1272,9 +1277,11 @@ pub(crate) fn log(frames: f64) {
     }
     tracing::info!(
         "  write-watch askings per frame that failed in the kernel: {:.0}; not made because the range \
-         is known guarded view memory: {:.0} (VICTORY_VIEW_ASK=1 asks the kernel anyway)",
+         is known guarded view memory: {:.0} (VICTORY_VIEW_ASK=1 asks the kernel anyway); grouped askings          that failed: {:.0} ({:.2} ms)",
         c[C::WatchFailed as usize],
         c[C::WatchKnownView as usize],
+        c[C::WatchAheadFailed as usize],
+        c[C::WatchAheadFailUs as usize] / 1e3,
     );
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \

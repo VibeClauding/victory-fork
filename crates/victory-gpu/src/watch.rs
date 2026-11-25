@@ -273,6 +273,12 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         )
     } != 0;
     if failed {
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::WatchAheadFailed, 1);
+            add(C::WatchAheadFailUs, started.elapsed().as_micros() as u64);
+        }
         return false;
     }
     #[cfg(feature = "diagnostics")]
