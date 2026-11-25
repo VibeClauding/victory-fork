@@ -108,7 +108,9 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         }
         // Split (bit 2): the groups past 65,535 in x, up to 65,535 more, run
         // as a second record (below), charged with the first.
-        uint rest = ((has_count & 4u) != 0 && g.x == 65535u) ? min(asked.x - 65535u, 65535u) : 0u;
+        // (The record's own x, as below: `asked` is the mesh records' count
+        // since #220, a single number, 0 here.)
+        uint rest = ((has_count & 4u) != 0 && g.x == 65535u) ? min(src_args.Load(src_at) - 65535u, 65535u) : 0u;
         if (rest != 0 && g.y * g.z != 0 && g.x + rest > GROUPS / (g.y * g.z)) {
             g = uint3(0, 0, 0);
             rest = 0;
@@ -357,7 +359,12 @@ pub(crate) fn bound_split(
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let both = bytes.checked_mul(2).filter(|&b| b <= u64::from(u32::MAX))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(both)?);
-    record_clamp_with(c, &list.list, &dst, budget, src, count, spec, (false, spec.0 == 2)).then_some(dst)
+    let before = list.indirect_state(&dst);
+    let recorded = record_clamp_with(c, &list.list, (&dst, before), budget, src, count, spec, (false, spec.0 == 2));
+    if recorded {
+        list.indirect_readable(&dst);
+    }
+    recorded.then_some(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -418,7 +425,7 @@ fn record_clamp_as(
     spec: (u32, u32, u32),
     ahead: bool,
 ) -> bool {
-    record_clamp_with(c, l, dst, budget, src, count, spec, (ahead, false))
+    record_clamp_with(c, l, (dst, before), budget, src, count, spec, (ahead, false))
 }
 
 /// [`record_clamp_as`]; `split`: dispatch records' groups past 65,535 in x
@@ -427,7 +434,7 @@ fn record_clamp_as(
 fn record_clamp_with(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
-    dst: &ID3D12Resource,
+    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
@@ -1446,7 +1453,7 @@ void main(uint3 g : SV_GroupID) {
         assert!(record_clamp_with(
             &warp.clamp,
             &warp.list,
-            &dst_buf,
+            (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
             budget_gpu,
             (&src_buf, 0),
             None,
@@ -1467,7 +1474,16 @@ void main(uint3 g : SV_GroupID) {
                 l.ExecuteIndirect(&sig, 1, &dst_buf, u64::from(STRIDE), None, 0);
             }
         }
-        done_on(&warp.list, &dst_buf);
+        // Back to common for the next use (since #220 the host keeps
+        // the scratch buffer readable and moves it once per list).
+        // SAFETY: an open list; the scratch buffer is in INDIRECT_ARGUMENT.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COMMON,
+            )])
+        };
         warp.submit_and_wait();
         // SAFETY: the GPU is done; mapped host memory.
         unsafe {
