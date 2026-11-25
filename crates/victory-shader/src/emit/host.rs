@@ -986,6 +986,8 @@ pub enum View<'a> {
     Cube(u32, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
+    /// Read back the entire allocation, but expose only its prefix for stores.
+    RawUavPrefix { allocation: u32, visible: u32 },
     /// An RGBA32F texture UAV (width, height), zeroed.
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
@@ -1003,6 +1005,8 @@ pub enum View<'a> {
 #[derive(Clone, Copy)]
 pub enum Stride {
     Raw,
+    /// A raw view over the first n dwords of a larger backing buffer.
+    RawPrefix(usize),
     /// RGBA32F elements.
     Typed,
     /// Structured, elements of this many bytes.
@@ -1224,7 +1228,7 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) => {
+                    View::RawUav(_) | View::RawUavPrefix { .. } | View::HalfUav(_) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::HalfUav(e) => (
@@ -1233,6 +1237,10 @@ impl Host {
                                 e,
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),
+                            View::RawUavPrefix { allocation, visible } => {
+                                assert!(visible <= allocation);
+                                (allocation, DXGI_FORMAT_R32_TYPELESS, visible, D3D12_BUFFER_UAV_FLAG_RAW)
+                            }
                             View::RawUav(n) => {
                                 (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
                             }
@@ -1312,6 +1320,10 @@ impl Host {
                     View::Buffer { data, stride } => {
                         let b = upload(data)?;
                         let (format, elements, stride, flags) = match stride {
+                            Stride::RawPrefix(n) => {
+                                assert!(n <= data.len());
+                                (DXGI_FORMAT_R32_TYPELESS, n, 0, D3D12_BUFFER_SRV_FLAG_RAW)
+                            }
                             Stride::Raw => (
                                 DXGI_FORMAT_R32_TYPELESS,
                                 data.len(),
