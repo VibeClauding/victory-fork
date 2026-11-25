@@ -94,11 +94,47 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    use victory_shader::emit;
+    // The hash the log names the shader by (`pipeline.rs`), which the
+    // per-program switches take.
+    let hash = blake3::hash(container).to_hex()[..16].to_owned();
+    let translate = |c: &[u8]| emit::for_program(&hash, || emit::translate(c)).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate),
+        Some(cache) => {
+            // (`wave64_retried` second: it parses the container, and only a
+            // program a list names, or with `VICTORY_WAVE_DEEP_SKIPS=0`
+            // any, gets there)
+            let off = !emit::deep_skips_allowed(Some(&hash)) && emit::wave64_retried(container);
+            let mut key = program_key(&build(), off);
+            // A program given the wave-wide form alone (`VICTORY_WAVE_WIDE_ONLY`): its own key too.
+            if emit::wide_allowed(Some(&hash)) {
+                let mut h = blake3::Hasher::new();
+                h.update(&key);
+                h.update(b"VICTORY_WAVE_WIDE on for this program");
+                key = *h.finalize().as_bytes();
+            }
+            cached(cache, &key, container, translate)
+        }
         None => translate(container),
     }
+}
+
+/// The key of one program's entries: the build's, mixed with the
+/// per-program decision when the program is kept out of the wave64 form
+/// "without skips, scalars followed" (`VICTORY_WAVE_DEEP_SKIPS_NOT`,
+/// `_ONLY`: `victory_shader::emit::deep_skips_allowed`). Only for a wave64
+/// compute program on a host of 32-lane waves, the only ones it can change.
+/// So the lists are in no key: changing one translates again only the
+/// programs whose decision it changes, and a program allowed the form keeps
+/// the key it had without any list.
+fn program_key(build: &[u8; 32], deep_skips_off: bool) -> [u8; 32] {
+    if !deep_skips_off {
+        return *build;
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(build);
+    h.update(b"VICTORY_WAVE_DEEP_SKIPS off for this program");
+    *h.finalize().as_bytes()
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -404,6 +440,39 @@ mod tests {
             }
         }
         files
+    }
+
+    #[test]
+    fn a_program_kept_out_of_the_deep_skips_form_has_a_key_of_its_own() {
+        let build = [7u8; 32];
+        assert_eq!(program_key(&build, false), build, "allowed: the build's key, as without lists");
+        let off = program_key(&build, true);
+        assert_ne!(off, build);
+        assert_eq!(program_key(&build, true), off, "the same decision, the same key");
+        assert_ne!(program_key(&[8; 32], true), off, "and still the build's");
+
+        // So only the program whose decision changed is translated again.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        let [a, b] = [b"program a".as_slice(), b"program b"];
+        for c in [a, b] {
+            cached(&cache, &program_key(&build, false), c, translate).unwrap();
+        }
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        // a listed: a translated again, b from the cache
+        cached(&cache, &program_key(&build, true), a, translate).unwrap();
+        cached(&cache, &program_key(&build, false), b, translate).unwrap();
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
+        // the list emptied again: both from the cache
+        for c in [a, b] {
+            cached(&cache, &program_key(&build, false), c, translate).unwrap();
+        }
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
     }
 
     #[test]
