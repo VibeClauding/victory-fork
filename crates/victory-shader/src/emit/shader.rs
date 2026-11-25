@@ -76,7 +76,7 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// ([`super::root_views_by_index`]). The view keeps its bounds, and every
 /// root argument a draw sets is then a root constant, which a command
 /// signature can set per record.
-pub const USER_VIEW_SLOT: u32 = 0x104;
+pub const USER_VIEW_SLOT: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
