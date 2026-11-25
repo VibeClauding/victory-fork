@@ -89,7 +89,7 @@ pub const USER_DISPATCH_THREADS: u32 = 0x104;
 /// ([`super::root_views_by_index`]). The view keeps its bounds, and every
 /// root argument a draw sets is then a root constant, which a command
 /// signature can set per record.
-pub const USER_VIEW_SLOT: u32 = 0x105;
+pub const USER_VIEW_SLOT: u32 = 0x106;
 /// `RootType::Other` code of a user-data dword the host computes: the
 /// thread-group id in x of the first group of this dispatch, added to the
 /// host's. A dispatch runs at most 65,535 groups in each dimension, the
@@ -97,7 +97,7 @@ pub const USER_VIEW_SLOT: u32 = 0x105;
 /// indirect record as a second execution with this dword at 65,535, and
 /// sets it to 0 everywhere else. Asked by programs that read the group id
 /// in x.
-pub const USER_GROUP_BASE: u32 = 0x106;
+pub const USER_GROUP_BASE: u32 = 0x105;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
